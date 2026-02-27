@@ -405,8 +405,65 @@ def show_dashboard_metrics():
         if not holdings.empty:
             fig_pie = px.pie(holdings, values='cost_price', names='fund_name', title="持仓分布", template='plotly_dark')
             st.plotly_chart(fig_pie, use_container_width=True)
+    
+    # 4. Fund Daily Performance History
+    if not holdings.empty:
+        st.markdown("### 📈 单个基金历史涨跌")
+        
+        fund_options = holdings.apply(lambda x: f"{x['fund_name']} ({x['fund_code']})", axis=1).tolist()
+        selected_fund = st.selectbox("选择基金查看历史涨跌", options=fund_options, key="fund_history_select")
+        
+        if selected_fund:
+            fund_code = selected_fund.split('(')[1].rstrip(')')
+            fund_name = selected_fund.split('(')[0].strip()
             
-    # 3. Market News & Tips
+            days_option = st.selectbox("查看天数", [7, 15, 30, 60, 90], index=2, key="fund_history_days")
+            
+            perf_df = database.get_fund_daily_performance(fund_code, days=days_option)
+            
+            if not perf_df.empty:
+                perf_df['date'] = pd.to_datetime(perf_df['date'])
+                perf_df = perf_df.sort_values('date')
+                
+                current_pct = perf_df.iloc[-1]['pct']
+                chart_color = '#FF3333' if current_pct >= 0 else '#00CC00'
+                
+                fig_perf = go.Figure()
+                fig_perf.add_trace(go.Scatter(
+                    x=perf_df['date'],
+                    y=perf_df['pct'],
+                    mode='lines+markers',
+                    name='涨跌幅%',
+                    line=dict(color=chart_color, width=2),
+                    marker=dict(size=4, color=chart_color),
+                    fill='tozeroy',
+                    fillcolor=f"rgba({255 if current_pct >= 0 else 0}, {51 if current_pct >= 0 else 204}, {51 if current_pct >= 0 else 0}, 0.1)"
+                ))
+                
+                fig_perf.update_layout(
+                    title=f"{fund_name} 近{days_option}日涨跌走势",
+                    template='plotly_dark',
+                    xaxis_title='日期',
+                    yaxis_title='涨跌幅 (%)',
+                    margin=dict(l=0, r=0, t=40, b=0),
+                    hovermode='x unified'
+                )
+                st.plotly_chart(fig_perf, use_container_width=True)
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("最新涨幅", f"{current_pct:+.2f}%", delta_color="inverse")
+                with col2:
+                    avg_pct = perf_df['pct'].mean()
+                    st.metric("平均涨幅", f"{avg_pct:+.2f}%", delta_color="inverse")
+                with col3:
+                    max_pct = perf_df['pct'].max()
+                    min_pct = perf_df['pct'].min()
+                    st.metric("区间波动", f"{max_pct:+.2f}% ~ {min_pct:+.2f}%", delta_color="inverse")
+            else:
+                st.info("暂无历史数据，数据将在每日刷新后自动累积。")
+    
+    # 5. Market News & Tips
     st.markdown("### � 市场动态 & 智能建议")
     c_news, c_tips = st.columns([1.8, 1.2])
     
@@ -1101,6 +1158,21 @@ def render_holdings():
                 
                 if ticks_to_save:
                     database.save_tick_batch(ticks_to_save)
+                
+                # Save daily performance for each fund
+                today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+                for idx, row in holdings.iterrows():
+                    fund_code = row['fund_code']
+                    fund_name = row['fund_name']
+                    est = data_api.get_real_time_estimate(fund_code, pre_fetched_data=batch_data.get(fund_code))
+                    if est and est.get('zzl') is not None:
+                        database.save_fund_daily_performance(
+                            fund_code, 
+                            fund_name, 
+                            today_str, 
+                            est['zzl'], 
+                            est['gz']
+                        )
             else:
                 st.info("🌙 当前非交易时段，自动刷新已暂停。")
                 # Use last known data if available

@@ -101,6 +101,19 @@ def init_db():
         )
     ''')
     
+    # Daily Fund Performance table: Stores daily percentage change for each fund
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS fund_daily_performance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fund_code TEXT NOT NULL,
+            fund_name TEXT,
+            date TEXT NOT NULL,
+            pct REAL NOT NULL,
+            price REAL,
+            UNIQUE(fund_code, date)
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
@@ -316,6 +329,54 @@ def get_asset_history():
         df = pd.read_sql_query("SELECT * FROM asset_history ORDER BY date ASC", conn)
     except:
         df = pd.DataFrame()
+    conn.close()
+    return df
+
+# --- Fund Daily Performance Operations ---
+def save_fund_daily_performance(fund_code, fund_name, date_str, pct, price):
+    """
+    Save daily performance data for a fund.
+    Uses INSERT OR REPLACE to update if data for same date exists.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute('''
+        INSERT OR REPLACE INTO fund_daily_performance (fund_code, fund_name, date, pct, price)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (fund_code, fund_name, date_str, pct, price))
+    conn.commit()
+    conn.close()
+
+def get_fund_daily_performance(fund_code, days=30):
+    """
+    Get daily performance history for a specific fund.
+    Returns DataFrame with columns ['date', 'pct', 'price']
+    """
+    conn = get_connection()
+    query = '''
+        SELECT date, pct, price 
+        FROM fund_daily_performance 
+        WHERE fund_code = ? 
+        ORDER BY date DESC 
+        LIMIT ?
+    '''
+    df = pd.read_sql(query, conn, params=(fund_code, days))
+    conn.close()
+    return df
+
+def get_all_funds_daily_performance(days=30):
+    """
+    Get daily performance for all funds.
+    Returns DataFrame with columns ['fund_code', 'fund_name', 'date', 'pct', 'price']
+    """
+    conn = get_connection()
+    query = '''
+        SELECT fund_code, fund_name, date, pct, price 
+        FROM fund_daily_performance 
+        WHERE date >= date('now', ?)
+        ORDER BY date DESC, fund_code
+    '''
+    df = pd.read_sql(query, conn, params=(f'-{days} days',))
     conn.close()
     return df
 

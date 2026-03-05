@@ -130,6 +130,34 @@ def _fetch_single_fund_realtime(fund_code):
                 }
     except Exception:
         pass
+    
+    # --- Fallback: Use AkShare historical NAV if real-time data is not available ---
+    try:
+        df = _fetch_fund_history_raw(fund_code)
+        if not df.empty:
+            latest = df.iloc[-1]
+            latest_nav = float(latest['单位净值'])
+            latest_date = str(latest['净值日期'].date())
+            
+            # Get daily growth rate if available
+            pct = 0.0
+            if '日增长率' in latest and pd.notna(latest['日增长率']):
+                pct = float(latest['日增长率'])
+            elif len(df) > 1:
+                prev_nav = float(df.iloc[-2]['单位净值'])
+                pct = ((latest_nav - prev_nav) / prev_nav) * 100
+            
+            return {
+                'code': fund_code,
+                'gz': latest_nav,
+                'zzl': round(pct, 2),
+                'est_date': latest_date,
+                'pre_close': latest_nav,
+                'confirmed_nav': latest_nav,
+                'time': '15:00:00'
+            }
+    except Exception:
+        pass
         
     return None
 

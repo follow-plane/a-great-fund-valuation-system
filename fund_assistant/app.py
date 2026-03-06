@@ -226,6 +226,13 @@ def show_dashboard_metrics():
                     ts = f"{est['data_date']} {est['time']}"
                     if len(est['time']) == 5: ts += ":00"
                     ticks_to_save.append((fund_code, ts, est['zzl'], est['gz']))
+                
+                # Save daily performance data
+                date_str = est.get('est_date', datetime.date.today().strftime('%Y-%m-%d'))
+                nav = float(est['gz'])
+                daily_growth = float(est['zzl'])
+                confirmed_nav = float(est.get('confirmed_nav', est['gz']))
+                database.save_fund_daily_performance(fund_code, date_str, nav, daily_growth, confirmed_nav)
             
             # Update session state with new data
             st.session_state['last_dashboard_data'] = {
@@ -407,62 +414,117 @@ def show_dashboard_metrics():
             st.plotly_chart(fig_pie, use_container_width=True)
     
     # 4. Fund Daily Performance History
-    if not holdings.empty:
-        st.markdown("### 📈 单个基金历史涨跌")
+    st.markdown("### 📈 单个基金历史涨跌")
+    
+    # Get all funds with performance data
+    fund_codes_with_data = database.get_all_fund_codes_with_performance()
+    
+    if fund_codes_with_data:
+        # Create options with fund names
+        fund_options = []
+        for code in fund_codes_with_data:
+            info = data_api.get_fund_base_info(code)
+            name = info.get('name', code) if info else code
+            fund_options.append(f"{name} ({code})")
         
-        fund_options = holdings.apply(lambda x: f"{x['fund_name']} ({x['fund_code']})", axis=1).tolist()
         selected_fund = st.selectbox("选择基金查看历史涨跌", options=fund_options, key="fund_history_select")
         
         if selected_fund:
             fund_code = selected_fund.split('(')[1].rstrip(')')
             fund_name = selected_fund.split('(')[0].strip()
             
-            days_option = st.selectbox("查看天数", [7, 15, 30, 60, 90], index=2, key="fund_history_days")
+            # Date range selector
+            col1, col2 = st.columns(2)
+            with col1:
+                start_date = st.date_input("开始日期", datetime.date.today() - datetime.timedelta(days=30))
+            with col2:
+                end_date = st.date_input("结束日期", datetime.date.today())
             
-            perf_df = logic.get_fund_daily_performance_history(fund_code, days=days_option)
+            # Get performance data from database
+            perf_df = database.get_fund_daily_performance(
+                fund_code, 
+                start_date=str(start_date), 
+                end_date=str(end_date)
+            )
             
             if not perf_df.empty:
+                # Convert date to datetime
                 perf_df['date'] = pd.to_datetime(perf_df['date'])
                 perf_df = perf_df.sort_values('date')
                 
-                current_pct = perf_df.iloc[-1]['pct']
-                chart_color = '#FF3333' if current_pct >= 0 else '#00CC00'
+                # Calculate cumulative return
+                perf_df['cumulative_return'] = (1 + perf_df['daily_growth']/100).cumprod() - 1
                 
-                fig_perf = go.Figure()
-                fig_perf.add_trace(go.Scatter(
-                    x=perf_df['date'],
-                    y=perf_df['pct'],
-                    mode='lines+markers',
-                    name='涨跌幅%',
-                    line=dict(color=chart_color, width=2),
-                    marker=dict(size=4, color=chart_color),
-                    fill='tozeroy',
-                    fillcolor=f"rgba({255 if current_pct >= 0 else 0}, {51 if current_pct >= 0 else 204}, {51 if current_pct >= 0 else 0}, 0.1)"
-                ))
+                # Create charts
+                col_chart1, col_chart2 = st.columns(2)
                 
-                fig_perf.update_layout(
-                    title=f"{fund_name} 近{days_option}日涨跌走势",
-                    template='plotly_dark',
-                    xaxis_title='日期',
-                    yaxis_title='涨跌幅 (%)',
-                    margin=dict(l=0, r=0, t=40, b=0),
-                    hovermode='x unified'
-                )
-                st.plotly_chart(fig_perf, use_container_width=True)
+                # Daily growth chart
+                with col_chart1:
+                    current_pct = perf_df.iloc[-1]['daily_growth']
+                    chart_color = '#FF3333' if current_pct >= 0 else '#00CC00'
+                    
+                    fig_perf = go.Figure()
+                    fig_perf.add_trace(go.Bar(
+                        x=perf_df['date'],
+                        y=perf_df['daily_growth'],
+                        name='日涨跌',
+                        marker_color=['#FF3333' if x >= 0 else '#00CC00' for x in perf_df['daily_growth']]
+                    ))
+                    fig_perf.update_layout(
+                        title=f"{fund_name} 日涨跌",
+                        template='plotly_dark',
+                        xaxis_title='日期',
+                        yaxis_title='涨跌 (%)',
+                        margin=dict(l=0, r=0, t=40, b=0)
+                    )
+                    st.plotly_chart(fig_perf, use_container_width=True)
                 
+                # Cumulative return chart
+                with col_chart2:
+                    fig_cumulative = go.Figure()
+                    fig_cumulative.add_trace(go.Scatter(
+                        x=perf_df['date'],
+                        y=perf_df['cumulative_return'] * 100,
+                        mode='lines+markers',
+                        name='累计收益',
+                        line=dict(color='#1E90FF', width=2),
+                        marker=dict(size=4, color='#1E90FF')
+                    ))
+                    fig_cumulative.update_layout(
+                        title=f"{fund_name} 累计收益",
+                        template='plotly_dark',
+                        xaxis_title='日期',
+                        yaxis_title='累计收益 (%)',
+                        margin=dict(l=0, r=0, t=40, b=0)
+                    )
+                    st.plotly_chart(fig_cumulative, use_container_width=True)
+                
+                # Show metrics
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("最新涨幅", f"{current_pct:+.2f}%", delta_color="inverse")
                 with col2:
-                    avg_pct = perf_df['pct'].mean()
-                    st.metric("平均涨幅", f"{avg_pct:+.2f}%", delta_color="inverse")
+                    avg_pct = perf_df['daily_growth'].mean()
+                    st.metric("平均涨幅", f"{avg_pct:+.2f}%")
                 with col3:
-                    max_pct = perf_df['pct'].max()
-                    min_pct = perf_df['pct'].min()
-                    st.metric("区间波动", f"{max_pct:+.2f}% ~ {min_pct:+.2f}%", delta_color="inverse")
+                    total_return = perf_df['cumulative_return'].iloc[-1] * 100
+                    st.metric("区间总收益", f"{total_return:+.2f}%")
+                
+                # Show data table
+                with st.expander("📋 详细数据"):
+                    display_df = perf_df.copy()
+                    display_df['date'] = display_df['date'].dt.strftime('%Y-%m-%d')
+                    display_df['nav'] = display_df['nav'].round(4)
+                    display_df['daily_growth'] = display_df['daily_growth'].round(2)
+                    display_df['cumulative_return'] = (display_df['cumulative_return'] * 100).round(2)
+                    
+                    st.dataframe(display_df[[
+                        'date', 'nav', 'daily_growth', 'cumulative_return'
+                    ]], use_container_width=True)
             else:
-                st.info("暂无足够的历史数据来生成图表。")
-    
+                st.info(f"该基金在所选日期范围内暂无历史数据。")
+    else:
+        st.info("暂无基金历史涨跌数据。请先添加基金到持仓并等待数据收集。")
     # 5. Market News & Tips
     st.markdown("### � 市场动态 & 智能建议")
     c_news, c_tips = st.columns([1.8, 1.2])
@@ -880,7 +942,7 @@ def render_stock_analysis():
                 time.sleep(1)
                 st.rerun()
     
-    run_interval = 3 if auto_refresh and logic.is_trading_time() else None
+    run_interval = 1 if auto_refresh and logic.is_trading_time() else None
     
     @st.fragment(run_every=run_interval)
     def _stock_fragment():
@@ -1512,6 +1574,18 @@ def render_plan():
         st.subheader("📋 我的定投计划")
         plans = database.get_plans()
         if not plans.empty:
+            # Execute plans button
+            if st.button("🔄 执行到期定投计划"):
+                with st.spinner("正在执行定投计划..."):
+                    executed = database.execute_investment_plans()
+                    if executed:
+                        st.success(f"成功执行了 {len(executed)} 个定投计划：")
+                        for plan in executed:
+                            st.info(f"✅ {plan['fund_name']} ({plan['fund_code']}): 定投 {plan['amount']}元，购买 {plan['shares']:.2f}份，净值 {plan['nav']:.4f}")
+                        st.rerun()
+                    else:
+                        st.info("当前没有需要执行的定投计划")
+            
             for idx, row in plans.iterrows():
                 with st.container(border=True):
                     c_info, c_act = st.columns([3, 1])

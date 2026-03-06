@@ -101,6 +101,19 @@ def init_db():
         )
     ''')
     
+    # Fund Daily Performance table: Stores daily performance for each fund
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS fund_daily_performance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fund_code TEXT NOT NULL,
+            date TEXT NOT NULL,
+            nav REAL NOT NULL,
+            daily_growth REAL NOT NULL,
+            confirmed_nav REAL,
+            UNIQUE(fund_code, date)
+        )
+    ''')
+    
 
     
     conn.commit()
@@ -258,6 +271,111 @@ def update_plan_status(plan_id, status):
     conn.commit()
     conn.close()
 
+# --- Investment Plan Execution ---  
+def execute_investment_plans():
+    """
+    Check and execute investment plans that are due.
+    Returns list of executed plans.
+    """
+    import datetime
+    from data_api import get_real_time_estimate
+    
+    conn = get_connection()
+    c = conn.cursor()
+    
+    # Get all active plans
+    c.execute("SELECT * FROM investment_plans WHERE status = 'active'")
+    plans = c.fetchall()
+    
+    executed_plans = []
+    
+    for plan in plans:
+        # Table structure: id, fund_code, fund_name, amount, frequency, start_date, status, execution_day
+        plan_id = plan[0]
+        fund_code = plan[1]
+        fund_name = plan[2]
+        amount = plan[3]
+        frequency = plan[4]
+        start_date = plan[5]
+        status = plan[6]
+        execution_day = plan[7]
+        
+        # Check if plan should be executed today
+        if _should_execute_plan(frequency, execution_day, start_date):
+            # Get current NAV
+            est = get_real_time_estimate(fund_code)
+            if est and 'gz' in est:
+                nav = float(est['gz'])
+                if nav > 0:
+                    # Calculate shares
+                    shares = amount / nav
+                    
+                    # Check if already holding this fund
+                    c.execute("SELECT id, share, cost_price FROM holdings WHERE fund_code = ?", (fund_code,))
+                    holding = c.fetchone()
+                    
+                    if holding:
+                        # Update existing holding
+                        holding_id, old_share, old_cost = holding
+                        # Calculate new cost using weighted average
+                        total_cost = old_share * old_cost + amount
+                        total_share = old_share + shares
+                        new_cost = total_cost / total_share
+                        
+                        c.execute('UPDATE holdings SET share = ?, cost_price = ? WHERE id = ?',
+                                  (total_share, new_cost, holding_id))
+                    else:
+                        # Add new holding
+                        purchase_date = datetime.datetime.now().strftime("%Y-%m-%d")
+                        c.execute('INSERT INTO holdings (fund_code, fund_name, share, cost_price, purchase_date) VALUES (?, ?, ?, ?, ?)',
+                                  (fund_code, fund_name, shares, nav, purchase_date))
+                    
+                    executed_plans.append({
+                        'fund_code': fund_code,
+                        'fund_name': fund_name,
+                        'amount': amount,
+                        'shares': shares,
+                        'nav': nav
+                    })
+    
+    conn.commit()
+    conn.close()
+    return executed_plans
+
+def _should_execute_plan(frequency, execution_day, start_date):
+    """
+    Check if a plan should be executed today.
+    """
+    import datetime
+    
+    today = datetime.datetime.now()
+    start_date_obj = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+    
+    # Check if plan has started
+    if today.date() < start_date_obj.date():
+        return False
+    
+    if frequency == '每日':
+        return True
+    elif frequency == '每周':
+        # execution_day: 1-5 for Mon-Fri
+        try:
+            exec_day = int(execution_day)
+            if 1 <= exec_day <= 5:
+                return today.weekday() == exec_day - 1  # 0=Mon, 4=Fri
+        except:
+            pass
+    elif frequency == '每月':
+        # execution_day: 1-28
+        try:
+            exec_day = int(execution_day)
+            if 1 <= exec_day <= 28:
+                return today.day == exec_day
+        except:
+            pass
+    
+    return False
+
 # --- Search History Operations ---
 def add_search_history(keyword):
     """Add a search keyword to history. Keeps only top 10."""
@@ -321,7 +439,71 @@ def get_asset_history():
     conn.close()
     return df
 
+# --- Fund Daily Performance Operations ---
+def save_fund_daily_performance(fund_code, date_str, nav, daily_growth, confirmed_nav=None):
+    """
+    Save daily performance data for a fund.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute('''
+        INSERT OR REPLACE INTO fund_daily_performance (fund_code, date, nav, daily_growth, confirmed_nav)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (fund_code, date_str, nav, daily_growth, confirmed_nav))
+    conn.commit()
+    conn.close()
 
+def save_fund_daily_batch(performance_data):
+    """
+    Save multiple daily performance records at once.
+    performance_data: list of tuples (fund_code, date, nav, daily_growth, confirmed_nav)
+    """
+    if not performance_data:
+        return
+        
+    conn = get_connection()
+    c = conn.cursor()
+    c.executemany('''
+        INSERT OR REPLACE INTO fund_daily_performance (fund_code, date, nav, daily_growth, confirmed_nav)
+        VALUES (?, ?, ?, ?, ?)
+    ''', performance_data)
+    conn.commit()
+    conn.close()
+
+def get_fund_daily_performance(fund_code, start_date=None, end_date=None):
+    """
+    Get daily performance data for a fund within date range.
+    Returns DataFrame with columns: ['date', 'nav', 'daily_growth', 'confirmed_nav']
+    """
+    conn = get_connection()
+    
+    query = "SELECT date, nav, daily_growth, confirmed_nav FROM fund_daily_performance WHERE fund_code = ?"
+    params = [fund_code]
+    
+    if start_date:
+        query += " AND date >= ?"
+        params.append(start_date)
+    
+    if end_date:
+        query += " AND date <= ?"
+        params.append(end_date)
+    
+    query += " ORDER BY date ASC"
+    
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
+
+def get_all_fund_codes_with_performance():
+    """
+    Get all fund codes that have daily performance data.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT fund_code FROM fund_daily_performance")
+    rows = c.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
 
 # Initialize DB on module load if not exists
 if not os.path.exists(DB_FILE):

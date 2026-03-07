@@ -807,6 +807,19 @@ def is_trading_time():
         
     return False
 
+def is_market_open():
+    """
+    Check if the market is currently open for trading.
+    Considers both trading hours and market holidays.
+    """
+    # First check if it's within trading hours
+    if not is_trading_time():
+        return False
+    
+    # TODO: Add holiday check here (can be implemented with API or local holiday list)
+    # For now, we'll just return based on trading hours
+    return True
+
 def get_effective_trading_date():
     """
     Get the effective trading date based on current time.

@@ -5,3 +5,4 @@ akshare
 requests
 openai
 numpy
+schedule

@@ -10,6 +10,13 @@ import database
 import data_api
 import logic
 
+# Setup auto investment scheduler
+try:
+    import auto_investment
+    auto_investment.setup_schedule()
+except Exception as e:
+    st.warning(f"自动定投功能初始化失败: {str(e)}")
+
 # --- Configuration & Setup ---
 st.set_page_config(
     page_title="智能理财助手",
@@ -90,16 +97,20 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- Data Prefetching (Fast Load) ---
+# --- Data Prefetching (Fast Load, Light Version) ---
+# 说明：首屏仅为前 5 只持仓做历史数据预取，避免持仓过多时首屏长时间卡住。
 if 'data_prefetched' not in st.session_state:
-    with st.spinner('🚀 正在连接交易所数据专线，加载全市场实时行情...'):
+    with st.spinner('🚀 正在连接交易所数据专线，加载核心持仓历史行情...'):
         # 1. Get all user holdings
         holdings = database.get_holdings()
         holding_codes = holdings['fund_code'].tolist() if not holdings.empty else []
-        
-        # 2. Parallel Fetch
-        data_api.prefetch_data(holding_codes)
-        
+
+        # 2. 仅对前若干只持仓做历史预取，避免大规模网络请求拖慢首页加载
+        MAX_PREFETCH_FUNDS = 5
+        codes_to_prefetch = holding_codes[:MAX_PREFETCH_FUNDS]
+        if codes_to_prefetch:
+            data_api.prefetch_data(codes_to_prefetch)
+
         # 3. Mark as done
         st.session_state['data_prefetched'] = True
 
@@ -108,7 +119,7 @@ st.sidebar.title("🚀 基金估值系统")
 if 'main_nav' not in st.session_state:
     st.session_state['main_nav'] = "仪表盘"
 
-page = st.sidebar.radio("导航", ["仪表盘", "股票行情", "基金查询 & 诊断", "持仓管理", "智能定投", "理财科普"], key="main_nav")
+page = st.sidebar.radio("导航", ["仪表盘", "股票行情", "基金查询 & 诊断", "外汇与商品", "持仓管理", "智能定投", "理财科普"], key="main_nav")
 
 if page == "股票行情":
     st.sidebar.markdown("---")
@@ -124,6 +135,8 @@ if page == "股票行情":
                 # Find the record
                 selected_stock = stocks[stocks.apply(lambda x: f"{x['name']} ({x['value']})" == selected_stock_str, axis=1)].iloc[0]
                 st.session_state['stock_code_to_analyze'] = selected_stock.to_dict()
+        else:
+            st.sidebar.warning("⚠️ 未找到相关股票，请尝试其他关键词")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🤖 AI 配置 (DeepSeek)")
@@ -182,8 +195,8 @@ def show_dashboard_metrics():
     # 1. Top Metrics (Holdings Summary)
     holdings = database.get_holdings()
     
-    # Check if we should skip API fetching (Auto-refresh ON but NOT trading time)
-    skip_api = auto_refresh and not logic.is_trading_time()
+    # Check if we should skip API fetching (Auto-refresh ON but NOT trading time or market closed)
+    skip_api = auto_refresh and not logic.is_market_open()
     
     # Try to load last state from session_state to prevent "zeroing out"
     if 'last_dashboard_data' not in st.session_state:
@@ -415,54 +428,62 @@ def show_dashboard_metrics():
     
     # 4. Fund Daily Performance History
     st.markdown("### 📈 单个基金历史涨跌")
-    
+
     # Get all funds with performance data
     fund_codes_with_data = database.get_all_fund_codes_with_performance()
-    
+
     if fund_codes_with_data:
-        # Create options with fund names
+        # 创建代码到名称的快速映射，优先使用本地持仓里的名称，避免为每只基金发起网络请求
+        holdings_name_map = {}
+        if not holdings.empty:
+            holdings_name_map = {
+                row['fund_code']: row['fund_name']
+                for _, row in holdings.iterrows()
+                if 'fund_code' in row and 'fund_name' in row
+            }
+
         fund_options = []
         for code in fund_codes_with_data:
-            info = data_api.get_fund_base_info(code)
-            name = info.get('name', code) if info else code
+            # 优先使用本地持仓名称，其次直接用代码，避免调用 data_api.get_fund_base_info 造成额外网络延迟
+            name = holdings_name_map.get(code, code)
             fund_options.append(f"{name} ({code})")
-        
+
         selected_fund = st.selectbox("选择基金查看历史涨跌", options=fund_options, key="fund_history_select")
-        
+
         if selected_fund:
             fund_code = selected_fund.split('(')[1].rstrip(')')
             fund_name = selected_fund.split('(')[0].strip()
-            
+
             # Date range selector
             col1, col2 = st.columns(2)
             with col1:
                 start_date = st.date_input("开始日期", datetime.date.today() - datetime.timedelta(days=30))
             with col2:
                 end_date = st.date_input("结束日期", datetime.date.today())
-            
+
             # Get performance data from database
             perf_df = database.get_fund_daily_performance(
-                fund_code, 
-                start_date=str(start_date), 
+                fund_code,
+                start_date=str(start_date),
                 end_date=str(end_date)
             )
-            
+
             if not perf_df.empty:
                 # Convert date to datetime
                 perf_df['date'] = pd.to_datetime(perf_df['date'])
                 perf_df = perf_df.sort_values('date')
-                
+
                 # Calculate cumulative return
                 perf_df['cumulative_return'] = (1 + perf_df['daily_growth']/100).cumprod() - 1
-                
+
                 # Create charts
                 col_chart1, col_chart2 = st.columns(2)
-                
+
                 # Daily growth chart
                 with col_chart1:
                     current_pct = perf_df.iloc[-1]['daily_growth']
                     chart_color = '#FF3333' if current_pct >= 0 else '#00CC00'
-                    
+
                     fig_perf = go.Figure()
                     fig_perf.add_trace(go.Bar(
                         x=perf_df['date'],
@@ -478,7 +499,7 @@ def show_dashboard_metrics():
                         margin=dict(l=0, r=0, t=40, b=0)
                     )
                     st.plotly_chart(fig_perf, use_container_width=True)
-                
+
                 # Cumulative return chart
                 with col_chart2:
                     fig_cumulative = go.Figure()
@@ -498,7 +519,7 @@ def show_dashboard_metrics():
                         margin=dict(l=0, r=0, t=40, b=0)
                     )
                     st.plotly_chart(fig_cumulative, use_container_width=True)
-                
+
                 # Show metrics
                 col1, col2, col3 = st.columns(3)
                 with col1:
@@ -509,7 +530,7 @@ def show_dashboard_metrics():
                 with col3:
                     total_return = perf_df['cumulative_return'].iloc[-1] * 100
                     st.metric("区间总收益", f"{total_return:+.2f}%")
-                
+
                 # Show data table
                 with st.expander("📋 详细数据"):
                     display_df = perf_df.copy()
@@ -517,7 +538,7 @@ def show_dashboard_metrics():
                     display_df['nav'] = display_df['nav'].round(4)
                     display_df['daily_growth'] = display_df['daily_growth'].round(2)
                     display_df['cumulative_return'] = (display_df['cumulative_return'] * 100).round(2)
-                    
+
                     st.dataframe(display_df[[
                         'date', 'nav', 'daily_growth', 'cumulative_return'
                     ]], use_container_width=True)
@@ -913,7 +934,7 @@ def render_stock_analysis():
         1. 在左侧边栏输入股票代码或名称进行搜索。
         2. 支持 A 股市场（沪深）实时行情。
         3. 包含分时图、K 线图（日/周/月）及五档盘口。
-        4. 开盘期间支持 3 秒自动刷新。
+        4. 开盘期间支持 1 秒自动刷新。
         """)
         return
 
@@ -1146,8 +1167,8 @@ def render_holdings():
     def _holdings_fragment():
         holdings = database.get_holdings()
         
-        # Check if we should skip API fetching (Auto-refresh ON but NOT trading time)
-        skip_api = auto_refresh and not logic.is_trading_time()
+        # Check if we should skip API fetching (Auto-refresh ON but NOT trading time or market closed)
+        skip_api = auto_refresh and not logic.is_market_open()
         
         # Initialize session state for holdings if not present
         if 'last_holdings_display' not in st.session_state:
@@ -1405,31 +1426,35 @@ def render_holdings():
                                 st.markdown(f"💰 预估回款金额: **{est_return:.2f}** 元")
                             
                             if st.form_submit_button("🚀 确认交易"):
-                                old_share = trade_row['share']
-                                old_cost = trade_row['cost_price']
-                                
-                                if "加仓" in trade_type:
-                                    # Buy: Input is Amount
-                                    # Calculate share delta
-                                    share_delta = t_amount / t_price if t_price > 0 else 0
-                                    new_share, new_cost = logic.calculate_new_cost(old_share, old_cost, share_delta, t_price, "buy")
-                                    
-                                    database.update_holding(trade_id, new_share, new_cost)
-                                    msg = f"已加仓 {t_amount}元 (约 {share_delta:.2f}份)。\n最新持仓: {new_share:.2f}份, 成本: {new_cost:.4f}"
+                                # Check if market is open
+                                if not logic.is_market_open():
+                                    st.warning("当前市场休市，交易将在下一个交易日生效")
                                 else:
-                                    # Sell: Input is Share
-                                    new_share, new_cost = logic.calculate_new_cost(old_share, old_cost, t_share, t_price, "sell")
+                                    old_share = trade_row['share']
+                                    old_cost = trade_row['cost_price']
                                     
-                                    database.update_holding(trade_id, new_share, new_cost)
-                                    msg = f"已减仓 {t_share}份。\n最新持仓: {new_share:.2f}份, 成本: {new_cost:.4f}"
-                                
-                                # Clear cache
-                                if 'last_holdings_display' in st.session_state: del st.session_state['last_holdings_display']
-                                if 'last_dashboard_data' in st.session_state: del st.session_state['last_dashboard_data']
-                                
-                                st.success(msg)
-                                time.sleep(1.5)
-                                st.rerun()
+                                    if "加仓" in trade_type:
+                                        # Buy: Input is Amount
+                                        # Calculate share delta
+                                        share_delta = t_amount / t_price if t_price > 0 else 0
+                                        new_share, new_cost = logic.calculate_new_cost(old_share, old_cost, share_delta, t_price, "buy")
+                                        
+                                        database.update_holding(trade_id, new_share, new_cost)
+                                        msg = f"已加仓 {t_amount}元 (约 {share_delta:.2f}份)。\n最新持仓: {new_share:.2f}份, 成本: {new_cost:.4f}"
+                                    else:
+                                        # Sell: Input is Share
+                                        new_share, new_cost = logic.calculate_new_cost(old_share, old_cost, t_share, t_price, "sell")
+                                        
+                                        database.update_holding(trade_id, new_share, new_cost)
+                                        msg = f"已减仓 {t_share}份。\n最新持仓: {new_share:.2f}份, 成本: {new_cost:.4f}"
+                                    
+                                    # Clear cache
+                                    if 'last_holdings_display' in st.session_state: del st.session_state['last_holdings_display']
+                                    if 'last_dashboard_data' in st.session_state: del st.session_state['last_dashboard_data']
+                                    
+                                    st.success(msg)
+                                    time.sleep(1.5)
+                                    st.rerun()
                     else:
                         st.caption("暂无持仓可交易")
 
@@ -1574,18 +1599,6 @@ def render_plan():
         st.subheader("📋 我的定投计划")
         plans = database.get_plans()
         if not plans.empty:
-            # Execute plans button
-            if st.button("🔄 执行到期定投计划"):
-                with st.spinner("正在执行定投计划..."):
-                    executed = database.execute_investment_plans()
-                    if executed:
-                        st.success(f"成功执行了 {len(executed)} 个定投计划：")
-                        for plan in executed:
-                            st.info(f"✅ {plan['fund_name']} ({plan['fund_code']}): 定投 {plan['amount']}元，购买 {plan['shares']:.2f}份，净值 {plan['nav']:.4f}")
-                        st.rerun()
-                    else:
-                        st.info("当前没有需要执行的定投计划")
-            
             for idx, row in plans.iterrows():
                 with st.container(border=True):
                     c_info, c_act = st.columns([3, 1])
@@ -1642,6 +1655,100 @@ def render_knowledge():
     else:
         st.warning("暂无新闻数据或获取失败。")
 
+def render_forex_commodity():
+    """
+    渲染外汇与商品页面
+    - 当左侧开启“实时刷新 (1秒级)”时，本页面也会按 1 秒自动刷新行情。
+    """
+    st.title("💱 外汇与商品")
+    st.caption("全球市场实时行情，数据来源于新浪财经")
+
+    # 根据侧边栏的 auto_refresh 开关动态设置刷新间隔
+    run_interval = 1 if auto_refresh else None
+
+    @st.fragment(run_every=run_interval)
+    def _forex_commodity_fragment():
+        # 页面布局
+        col1, col2 = st.columns([3, 1])
+
+        with col1:
+            # 主要内容区域
+            st.markdown("## 📈 实时行情")
+
+            # 获取数据
+            try:
+                import data_api
+
+                # 1. 货币汇率
+                st.markdown("### 主要货币")
+                currency_rates = data_api.get_currency_rates()
+
+                if currency_rates:
+                    # 4列布局显示货币
+                    fx_cols = st.columns(4)
+                    for i, rate in enumerate(currency_rates[:8]):
+                        col_idx = i % 4
+                        with fx_cols[col_idx]:
+                            st.metric(
+                                f"{rate['name']} ({rate['symbol']})",
+                                f"{rate['price']:.4f}",
+                                f"{rate['pct']:+.3f}%",
+                                delta_color="inverse"
+                            )
+                else:
+                    st.info("货币汇率数据加载中...")
+
+                st.markdown("### 贵金属")
+                precious_metals = data_api.get_precious_metals()
+
+                if precious_metals:
+                    # 4列布局显示贵金属
+                    metal_cols = st.columns(4)
+                    for i, metal in enumerate(precious_metals[:4]):
+                        col_idx = i % 4
+                        with metal_cols[col_idx]:
+                            st.metric(
+                                metal['name'],
+                                f"{metal['price']:.2f}" if metal['price'] < 1000 else f"{metal['price']:,.0f}",
+                                f"{metal['pct']:+.2f}%",
+                                delta_color="inverse"
+                            )
+                else:
+                    st.info("贵金属数据加载中...")
+
+                st.markdown("### 全球商品")
+                commodities = data_api.get_commodity_prices()
+
+                if commodities:
+                    # 4列布局显示商品
+                    commodity_cols = st.columns(4)
+                    for i, commodity in enumerate(commodities[:8]):
+                        col_idx = i % 4
+                        with commodity_cols[col_idx]:
+                            st.metric(
+                                f"{commodity['name']}",
+                                f"{commodity['price']:.2f}" if commodity['price'] < 1000 else f"{commodity['price']:,.0f}",
+                                f"{commodity['pct']:+.2f}%",
+                                delta_color="inverse"
+                            )
+                else:
+                    st.info("商品数据加载中...")
+
+            except Exception as e:
+                st.error(f"加载数据时出错: {str(e)}")
+
+        with col2:
+            # 侧边栏区域
+            # 数据更新时间
+            st.markdown("## 📅 数据更新")
+            st.info(f"最后更新: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+            # 刷新按钮（在自动刷新关闭时仍可手动刷新）
+            if st.button("🔄 刷新数据", use_container_width=True):
+                st.rerun()
+
+    _forex_commodity_fragment()
+
 # --- Main Routing ---
 if page == "仪表盘":
     render_dashboard()
@@ -1649,6 +1756,8 @@ elif page == "股票行情":
     render_stock_analysis()
 elif page == "基金查询 & 诊断":
     render_search()
+elif page == "外汇与商品":
+    render_forex_commodity()
 elif page == "持仓管理":
     render_holdings()
 elif page == "智能定投":

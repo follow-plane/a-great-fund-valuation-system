@@ -279,6 +279,11 @@ def execute_investment_plans():
     """
     import datetime
     from data_api import get_real_time_estimate
+    from logic import is_market_open
+    
+    # Check if market is open before executing plans
+    if not is_market_open():
+        return []
     
     conn = get_connection()
     c = conn.cursor()
